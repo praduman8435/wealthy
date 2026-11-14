@@ -1,0 +1,37 @@
+{{- define "spire-identity-exchange.cert-manager-default-cert" }}
+{{-   $fullName := include "spire-identity-exchange.fullname" . }}
+dnsNames:
+  {{- if ne (len .Values.tls.certManager.certificate.dnsNames) 0 }}
+  {{-   toYaml .Values.tls.certManager.certificate.dnsNames | nindent 4 }}
+  {{- else }}
+  {{-   $hosts := list }}
+  {{-   range $l := list .Values.tls.rest .Values.tls.grpc }}
+  {{-     if $l.enabled }}
+  {{-       if $l.ingress.enabled }}
+  {{-         $hosts = append $hosts (include "spire-lib.ingress-calculated-name" (dict "ingress" $l.ingress "Values" $.Values) | trim) }}
+  {{-       end }}
+  {{-       if $l.gatewayAPI.enabled }}
+  {{-         $hosts = append $hosts (include "spire-lib.ingress-calculated-name" (dict "ingress" (dict "host" $l.gatewayAPI.host) "Values" $.Values) | trim) }}
+  {{-       end }}
+  {{-     end }}
+  {{-   end }}
+  {{-   toYaml (uniq $hosts) | nindent 4 }}
+  {{- end }}
+issuerRef:
+  {{- with .Values.tls.certManager.certificate.issuerRef.group }}
+  group: {{ . }}
+  {{- end }}
+  kind: {{ default "Issuer" .Values.tls.certManager.certificate.issuerRef.kind }}
+  name: {{ default $fullName .Values.tls.certManager.certificate.issuerRef.name }}
+secretName: {{ $fullName }}-cert
+{{- end }}
+{{- if and .Values.tls.certManager.enabled (or .Values.tls.rest.enabled .Values.tls.grpc.enabled) }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "spire-identity-exchange.fullname" . }}
+  namespace: {{ include "spire-identity-exchange.namespace" . }}
+spec:
+  {{ merge (include "spire-identity-exchange.cert-manager-default-cert" . | fromYaml) .Values.tls.certManager.certificate | toYaml | nindent 2 }}
+{{- end }}

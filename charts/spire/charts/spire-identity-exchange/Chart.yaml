@@ -1,0 +1,26 @@
+apiVersion: v2
+appVersion: v0.6.0
+dependencies:
+- name: spire-lib
+  repository: file://../spire-lib
+  version: 0.3.3
+description: A Helm chart to install the SPIRE Identity Exchange.
+home: https://github.com/spiffe/helm-charts-hardened/tree/main/charts/spire-identity-exchange
+icon: https://spiffe.io/img/logos/spire/icon/color/spire-icon-color.png
+keywords:
+- spiffe
+- spire
+- identity exchange
+maintainers:
+- email: marco.franssen@gmail.com
+  name: marcofranssen
+  url: https://marcofranssen.nl
+- email: Kevin.Fox@pnnl.gov
+  name: kfox1111
+- email: fymemon@yahoo.com
+  name: faisal-memon
+name: spire-identity-exchange
+sources:
+- https://github.com/spiffe/helm-charts-hardened/tree/main/charts/spire-identity-exchange
+type: application
+version: 0.2.4

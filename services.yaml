@@ -1,0 +1,296 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend
+  namespace: demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders
+  namespace: demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments
+  namespace: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: frontend
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          env:
+            - name: PODINFO_UI_COLOR
+              value: "#1d4ed8"
+            - name: PODINFO_UI_MESSAGE
+              value: "FRONTEND | spiffe://wealthy.local/ns/demo/sa/frontend"
+            - name: PODINFO_BACKEND_URL
+              value: "http://localhost:9000/echo"
+        - name: to-orders
+          image: ghostunnel/ghostunnel:v1.11.5
+          args:
+            - client
+            - --listen=localhost:9000
+            - --target=orders:8443
+            - --verify-uri=spiffe://wealthy.local/ns/demo/sa/orders
+            - --use-workload-api-addr=unix:///spiffe-workload-api/spire-agent.sock
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+        - name: to-payments
+          image: ghostunnel/ghostunnel:v1.11.5
+          args:
+            - client
+            - --listen=localhost:9001
+            - --target=payments:8443
+            - --verify-uri=spiffe://wealthy.local/ns/demo/sa/payments
+            - --use-workload-api-addr=unix:///spiffe-workload-api/spire-agent.sock
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+      volumes:
+        - name: spiffe
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-envoy
+  namespace: demo
+data:
+  envoy.yaml: |
+    node: { id: orders, cluster: demo }
+    static_resources:
+      listeners:
+        - name: inbound-mtls
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8443 }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  require_client_certificate: true
+                  common_tls_context:
+                    tls_certificate_sds_secret_configs:
+                      - name: spiffe://wealthy.local/ns/demo/sa/orders
+                        sds_config:
+                          resource_api_version: V3
+                          api_config_source:
+                            api_type: GRPC
+                            transport_api_version: V3
+                            grpc_services:
+                              - envoy_grpc: { cluster_name: spire_agent }
+                    validation_context_sds_secret_config:
+                      name: spiffe://wealthy.local
+                      sds_config:
+                        resource_api_version: V3
+                        api_config_source:
+                          api_type: GRPC
+                          transport_api_version: V3
+                          grpc_services:
+                            - envoy_grpc: { cluster_name: spire_agent }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: inbound
+                    route_config:
+                      virtual_hosts:
+                        - name: orders
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: orders_app }
+                    http_filters:
+                      - name: envoy.filters.http.rbac
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                          rules:
+                            action: ALLOW
+                            policies:
+                              frontend-allowed-routes:
+                                principals:
+                                  - authenticated:
+                                      principal_name: { exact: "spiffe://wealthy.local/ns/demo/sa/frontend" }
+                                permissions:
+                                  - url_path: { path: { exact: "/" } }
+                                  - url_path: { path: { prefix: "/api/" } }
+                                  - url_path: { path: { exact: "/echo" } }
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        - name: orders_app
+          connect_timeout: 1s
+          load_assignment:
+            cluster_name: orders_app
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 9898 }
+        - name: spire_agent
+          connect_timeout: 1s
+          typed_extension_protocol_options:
+            envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+              "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+              explicit_http_config:
+                http2_protocol_options: {}
+          load_assignment:
+            cluster_name: spire_agent
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        pipe: { path: /spiffe-workload-api/spire-agent.sock }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: orders
+  template:
+    metadata:
+      labels:
+        app: orders
+    spec:
+      serviceAccountName: orders
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          env:
+            - name: PODINFO_UI_COLOR
+              value: "#15803d"
+            - name: PODINFO_UI_MESSAGE
+              value: "ORDERS | reached over mTLS | frontend only, routes / /api/* /echo"
+            - name: PODINFO_BACKEND_URL
+              value: "http://localhost:9000/echo"
+        - name: mtls-in
+          image: envoyproxy/envoy:v1.40.2
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warn"]
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+        - name: to-payments
+          image: ghostunnel/ghostunnel:v1.11.5
+          args:
+            - client
+            - --listen=localhost:9000
+            - --target=payments:8443
+            - --verify-uri=spiffe://wealthy.local/ns/demo/sa/payments
+            - --use-workload-api-addr=unix:///spiffe-workload-api/spire-agent.sock
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: orders-envoy
+        - name: spiffe
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+  namespace: demo
+spec:
+  selector:
+    app: orders
+  ports:
+    - port: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app: payments
+  template:
+    metadata:
+      labels:
+        app: payments
+    spec:
+      serviceAccountName: payments
+      containers:
+        - name: app
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          env:
+            - name: PODINFO_UI_COLOR
+              value: "#7e22ce"
+            - name: PODINFO_UI_MESSAGE
+              value: "PAYMENTS | reached over mTLS | accepts only orders"
+            - name: PODINFO_BACKEND_URL
+              value: "http://localhost:9000/echo"
+        - name: mtls-in
+          image: ghostunnel/ghostunnel:v1.11.5
+          args:
+            - server
+            - --listen=0.0.0.0:8443
+            - --target=localhost:9898
+            - --allow-uri=spiffe://wealthy.local/ns/demo/sa/orders
+            - --use-workload-api-addr=unix:///spiffe-workload-api/spire-agent.sock
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+        - name: to-shipping
+          image: ghostunnel/ghostunnel:v1.11.5
+          args:
+            - client
+            - --listen=localhost:9000
+            - --target=shipping:8443
+            - --verify-uri=spiffe://wealthy.local/vm/shipping
+            - --use-workload-api-addr=unix:///spiffe-workload-api/spire-agent.sock
+          volumeMounts:
+            - name: spiffe
+              mountPath: /spiffe-workload-api
+      volumes:
+        - name: spiffe
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments
+  namespace: demo
+spec:
+  selector:
+    app: payments
+  ports:
+    - port: 8443

@@ -1,0 +1,58 @@
+services:
+
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:1.15.5
+    command: ["-config", "/agent.conf", "-joinToken", "${JOIN_TOKEN:-}"]
+    configs:
+      - source: agent-config
+        target: /agent.conf
+    pid: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - spire-socket:/run/spire/sockets
+    networks: [kind]
+
+  shipping:
+    image: ghcr.io/stefanprodan/podinfo:6.17.0
+    hostname: shipping-outside-k8s
+    environment:
+      PODINFO_UI_COLOR: "#c2410c"
+      PODINFO_UI_MESSAGE: "SHIPPING | outside the cluster | accepts only payments"
+    networks: [kind]
+
+  shipping-mtls:
+    image: ghostunnel/ghostunnel:v1.11.5
+    labels:
+      app: shipping
+    network_mode: "service:shipping"
+    command:
+      - server
+      - --listen=0.0.0.0:8443
+      - --target=localhost:9898
+      - --allow-uri=spiffe://wealthy.local/ns/demo/sa/payments
+      - --use-workload-api-addr=unix:///run/spire/sockets/agent.sock
+    volumes:
+      - spire-socket:/run/spire/sockets:ro
+
+configs:
+  agent-config:
+    content: |
+      agent {
+        trust_domain       = "wealthy.local"
+        server_address     = "spire-demo-control-plane"
+        server_port        = "30081"
+        socket_path        = "/run/spire/sockets/agent.sock"
+        insecure_bootstrap = true
+      }
+      plugins {
+        NodeAttestor "join_token" { plugin_data {} }
+        KeyManager "memory" { plugin_data {} }
+        WorkloadAttestor "docker" { plugin_data {} }
+      }
+
+volumes:
+  spire-socket: {}
+
+networks:
+  kind:
+    external: true

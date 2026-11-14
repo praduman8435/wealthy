@@ -1,0 +1,899 @@
+{{- $rawPodSecurityContext := fromYaml (include "spire-lib.podsecuritycontext" .) }}
+{{- $podSecurityContext := fromYaml (include "spire-server.podSecurityContext" .) }}
+{{- $needsChown := and (not (hasKey $rawPodSecurityContext "runAsUser")) (not (dig "openshift" false .Values.global)) }}
+{{- $configSum := (include (print $.Template.BasePath "/configmap.yaml") . | sha256sum) }}
+{{- $configSum2 := (include (print $.Template.BasePath "/secret.yaml") . | sha256sum) }}
+{{- $configSum3 := (include (print $.Template.BasePath "/controller-manager-configmap.yaml") . | sha256sum) }}
+{{- $configSumTornjak := (include (print $.Template.BasePath "/tornjak-config.yaml") . | sha256sum) }}
+{{- $fullname := include "spire-server.fullname" . }}
+{{- if hasKey .Values "ca_subject" }}
+{{-   fail "ca_subject was renamed to caSubject. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.caSubject "common_name" }}
+{{-   fail "ca_name was renamed to caName. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.upstreamAuthority.certManager "issuer_name" }}
+{{-   fail "issuer_name was renamed to issuerName. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.upstreamAuthority.certManager "issuer_group" }}
+{{-   fail "issuer_group was renamed to issuerGroup. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.upstreamAuthority.certManager "issuer_kind" }}
+{{-   fail "issuer_kind was renamed to issuerKind. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.upstreamAuthority.certManager "kube_config_file" }}
+{{-   fail "kube_config_file was renamed to kubeConfigFile. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.nodeAttestor "k8sPsat" }}
+{{-   fail "k8sPsat was renamed to k8sPSAT. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.nodeAttestor "externalK8sPsat" }}
+{{-   fail "externalK8sPsat was renamed to externalK8sPSAT. Please update your config." }}
+{{- end }}
+{{- if hasKey .Values.notifier "k8sbundle" }}
+{{-   fail "k8sbundle was renamed to k8sBundle. Please update your config." }}
+{{- end }}
+{{- if eq .Values.kind "statefulset" }}
+{{-   if not (has .Values.persistence.type (list "pvc" "hostPath" "emptyDir")) }}
+{{-     fail "persistence.type must be one of [\"pvc\", \"hostPath\", \"emptyDir\"]" }}
+{{-   end }}
+{{- else if eq .Values.kind "deployment" }}
+{{-   if (has .Values.persistence.type (list "pvc" "hostPath")) }}
+{{-     fail "When running as deployment, persistence can't be set. 'persistence.type' must be [\"emptyDir\"]" }}
+{{-   end }}
+{{-   if and (eq .Values.dataStore.sql.databaseType "sqlite3") (not .Values.dataStore.sql.inMemory) }}
+{{-     fail "When running as deployment, sqlite3 can only be used in memory. Set 'dataStore.sql.inMemory' to true." }}
+{{-   end }}
+{{-   if and (eq .Values.dataStore.sql.databaseType "sqlite3") .Values.dataStore.sql.inMemory }}
+{{-     $surge := dig "rollingUpdate" "maxSurge" "" .Values.updateStrategy | toString }}
+{{-     if not (or (eq (dig "type" "" .Values.updateStrategy) "Recreate") (eq $surge "0") (eq $surge "0%")) }}
+{{-       fail "An in-memory datastore on a deployment must not surge, or two servers run with separate datastores. Set 'updateStrategy' to {type: Recreate} or {rollingUpdate: {maxSurge: 0}}." }}
+{{-     end }}
+{{-   end }}
+{{-   if (eq (.Values.keyManager.disk.enabled | toString) "true") }}
+{{-     fail "When running as deployment, disk keymanager can't be used. 'keyManager.disk.enabled' must be false." }}
+{{-   end }}
+{{- else }}
+{{-   fail "Unsupported kind." }}
+{{- end }}
+{{- if hasKey .Values.dataStore.sql "plugin_data" }}
+{{-   fail "The plugin_data setting to the sql data store is no longer supported." }}
+{{- end }}
+{{- $certPathDatabaseType := or (eq .Values.dataStore.sql.databaseType "mysql") (eq .Values.dataStore.sql.databaseType "aws_mysql") (eq .Values.dataStore.sql.databaseType "postgres") (eq .Values.dataStore.sql.databaseType "aws_postgres") }}
+{{- if not $certPathDatabaseType }}
+{{-   if ne .Values.dataStore.sql.rootCAPath "" }}
+{{-     fail "rootCAPath can only be set with database type mysql, aws_mysql, postgres or aws_postgres." }}
+{{-   end }}
+{{-   if ne .Values.dataStore.sql.clientCertPath "" }}
+{{-     fail "clientCertPath can only be set with database type mysql, aws_mysql, postgres or aws_postgres." }}
+{{-   end }}
+{{-   if ne .Values.dataStore.sql.clientKeyPath "" }}
+{{-     fail "clientKeyPath can only be set with database type mysql, aws_mysql, postgres or aws_postgres." }}
+{{-   end }}
+{{- end }}
+{{- if and (or (eq .Values.dataStore.sql.databaseType "postgres") (eq .Values.dataStore.sql.databaseType "aws_postgres")) (ne .Values.dataStore.sql.password "") (ne .Values.dataStore.sql.clientCertPath "") }}
+{{-   fail "dataStore.sql.password and dataStore.sql.clientCertPath are mutually exclusive for postgres; use one authentication method." }}
+{{- end }}
+{{- $pluginsToLoad := include "spire-lib.extract_custom_plugin_images" . | fromYamlArray }}
+{{- $jwtExecNeeded := false }}
+{{- range $name, $value := .Values.kubeConfigs }}
+{{-   if hasKey $value "jwtSVIDExec" }}{{ $jwtExecNeeded = true }}{{- end }}
+{{- end }}
+{{- $pluginLoaderNeeded := or .Values.credentialComposer.cel.enabled .Values.spireIdentityExchange.enabled (gt (len $pluginsToLoad) 0) $jwtExecNeeded }}
+{{- if not .Values.externalServer }}
+apiVersion: apps/v1
+{{- if eq .Values.kind "statefulset" }}
+kind: StatefulSet
+{{- else if eq .Values.kind "deployment" }}
+kind: Deployment
+{{- end }}
+metadata:
+  name: {{ include "spire-server.fullname" . }}
+  namespace: {{ include "spire-server.namespace" . }}
+  labels:
+    {{- include "spire-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  {{- if and (eq .Values.dataStore.sql.databaseType "sqlite3") (gt (int .Values.replicaCount) 1) }}
+  {{- fail "When running with sqlite3 database, you can't scale up to more then one instance. 'replicaCount' MUST be 1" }}
+  {{- end }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- with .Values.updateStrategy }}
+  {{- if eq $.Values.kind "statefulset" }}
+  updateStrategy:
+  {{- else }}
+  strategy:
+  {{- end }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if eq .Values.kind "statefulset" }}
+  serviceName: {{ include "spire-server.fullname" . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "spire-server.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: spire-server
+        checksum/config: {{ $configSum }}
+        checksum/config2: {{ $configSum2 }}
+        checksum/config3: {{ $configSum3 }}
+        checksum/configTornjak: {{ $configSumTornjak }}
+        {{- with .Values.podAnnotations }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "spire-server.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+        component: server
+        release: {{ .Release.Name }}
+        release-namespace: {{ .Release.Namespace }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with (coalesce .Values.imagePullSecrets .Values.global.imagePullSecrets) }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "spire-server.serviceAccountName" . }}
+      shareProcessNamespace: true
+      securityContext:
+        {{- $podSecurityContext | toYaml | nindent 8 }}
+      {{- include "spire-lib.default_cluster_priority_class_name" . | nindent 6 }}
+      {{- if or (gt (len .Values.initContainers) 0) (and .Values.upstreamAuthority.certManager.enabled .Values.upstreamAuthority.certManager.ca.create) .Values.nodeAttestor.tpmDirect.enabled $pluginLoaderNeeded $needsChown }}
+      initContainers:
+        {{- if $pluginLoaderNeeded }}
+        - name: init-plugins
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.tools.busybox.image "global" .Values.global) }}
+          # SPIRE must be able to fork the plugin directly within its container. First copy a busybox so that the plugin can be copied into the right place.
+          command:
+            - busybox
+            - sh
+            - -ec
+            - |
+              cp -a /bin/busybox /plugins/busybox
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ .Values.tools.busybox.image.pullPolicy }}
+        {{- end }}
+        {{- if .Values.credentialComposer.cel.enabled }}
+        - name: init-cel
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.credentialComposer.cel.image "global" .Values.global) }}
+          # Second, use the previously copied busybox to copy the plugin into a volume that can be mounted where SPIRE can execute it.
+          command:
+            - /plugins/busybox
+            - sh
+            - -ec
+            - |
+              /plugins/busybox cp -a {{ .Values.credentialComposer.cel.pluginPath }} /plugins/credentialcomposer-cel
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ .Values.credentialComposer.cel.image.pullPolicy }}
+        {{- end }}
+        {{- if .Values.spireIdentityExchange.enabled }}
+        - name: init-six
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.credentialComposer.spireIdentityExchange.image "global" .Values.global) }}
+          # Second, use the previously copied busybox to copy the plugin into a volume that can be mounted where SPIRE can execute it.
+          command:
+            - /plugins/busybox
+            - sh
+            - -ec
+            - |
+              /plugins/busybox cp -a {{ .Values.credentialComposer.spireIdentityExchange.pluginPath }} /plugins/credentialcomposer-identity-exchange
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ .Values.credentialComposer.spireIdentityExchange.image.pullPolicy }}
+        {{- end }}
+        {{- if $jwtExecNeeded }}
+        - name: init-jwt-svid-exec
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.jwtSVIDExecConfig.image "global" .Values.global) }}
+          # Use the previously copied busybox to stage the exec credential plugin binary where the kubeConfigs consumers can fork it.
+          command:
+            - /plugins/busybox
+            - sh
+            - -ec
+            - |
+              /plugins/busybox cp -a {{ .Values.jwtSVIDExecConfig.pluginPath }} {{ include "spire-server.jwt-svid-exec-binary-path" . }}
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ .Values.jwtSVIDExecConfig.image.pullPolicy }}
+        {{- end }}
+        {{- range $idx, $plugin := $pluginsToLoad }}
+        - name: {{ printf "init-plugin-%d" $idx }}
+          securityContext:
+            {{- include "spire-lib.securitycontext" $ | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" $plugin.image "global" $.Values.global) }}
+          command:
+            - /plugins/busybox
+            - sh
+            - -ec
+            - |
+              /plugins/busybox mkdir -p /plugins/{{ dir $plugin.name }}
+              /plugins/busybox cp -a {{ $plugin.plugin_cmd }} /plugins/{{ $plugin.name }}
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ $plugin.image.pullPolicy }}
+        {{- end }}
+        {{- if $pluginLoaderNeeded }}
+        - name: finalize-plugins
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.tools.busybox.image "global" .Values.global) }}
+          command:
+            - busybox
+            - sh
+            - -ec
+            - |
+              rm -f /plugins/busybox
+          volumeMounts:
+            - name: plugins
+              mountPath: /plugins
+          imagePullPolicy: {{ .Values.tools.busybox.image.pullPolicy }}
+        {{- end }}
+        {{- if .Values.nodeAttestor.tpmDirect.enabled }}
+        - name: init-tpm-direct
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.nodeAttestor.tpmDirect.image "global" .Values.global) }}
+          command:
+            - sh
+            - -ec
+            - |
+              # SPIRE must be able to fork the plugin directly within its container. Copy the plugin into a volume that can be mounted where SPIRE can execute it.
+              cp -a {{ .Values.nodeAttestor.tpmDirect.pluginPath }} /tpm/tpm_attestor_server
+              mkdir -p /run/spire/data/tpm-direct/certs
+              mkdir -p /run/spire/data/tpm-direct/hashes
+          volumeMounts:
+            - name: tpm-direct
+              mountPath: /tpm
+            - name: spire-data
+              mountPath: /run/spire/data
+          imagePullPolicy: {{ .Values.nodeAttestor.tpmDirect.image.pullPolicy }}
+      {{- end }}
+      {{- if $needsChown }}
+        - name: chown
+          image: {{ template "spire-lib.image" (dict "image" .Values.chown.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.chown.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              chown -R {{ $podSecurityContext.runAsUser }}:{{ $podSecurityContext.runAsGroup }} /var/lib/spire
+          resources:
+            {{- toYaml .Values.chown.resources | nindent 12 }}
+          volumeMounts:
+            - name: spire-data
+              mountPath: /var/lib/spire
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+      {{- end }}
+      {{- if and .Values.upstreamAuthority.certManager.enabled .Values.upstreamAuthority.certManager.ca.create }}
+        - name: wait
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.kubectl-image" (dict "appVersion" $.Chart.AppVersion "image" .Values.tools.kubectl.image "global" .Values.global "KubeVersion" .Capabilities.KubeVersion.Version) }}
+          args:
+            - wait
+            - --namespace
+            - {{ include "spire-server.namespace" $ }}
+            - --timeout=3m
+            - --for=condition=ready
+            - issuer
+            - {{ include "spire-server.fullname" $ }}-ca
+          imagePullPolicy: {{ .Values.tools.kubectl.image.pullPolicy }}
+      {{- end }}
+      {{- if gt (len .Values.initContainers) 0 }}
+        {{- toYaml .Values.initContainers | nindent 8 }}
+      {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" $.Chart.AppVersion "image" .Values.image "global" .Values.global) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -expandEnv
+            - -config
+            - /run/spire/config/server.conf
+          env:
+          - name: PATH
+            value: "/opt/spire/bin:/bin"
+          {{- if .Values.gcpWorkloadIdentity.enabled }}
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: /etc/gcp-wif/credential-configuration.json
+          {{- end }}
+          {{- with .Values.extraEnv }}
+          {{- . | toYaml | nindent 10 }}
+          {{- end }}
+          {{- $postgresPasswordless := eq (include "spire-server.datastore-postgres-passwordless" .) "true" }}
+          {{- $postgresRoPasswordless := eq (include "spire-server.datastore-postgres-ro-passwordless" .) "true" }}
+          {{- if and (ne .Values.dataStore.sql.databaseType "sqlite3") (ne .Values.dataStore.sql.databaseType "gcp_mysql_sa_iam") (not $postgresPasswordless) }}
+          {{- if .Values.dataStore.sql.externalSecret.enabled }}
+          - name: DBPW
+            valueFrom:
+              secretKeyRef:
+                name: {{ .Values.dataStore.sql.externalSecret.name }}
+                key: {{ .Values.dataStore.sql.externalSecret.key }}
+          {{- else }}
+          - name: DBPW
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-dbpw
+                key: DBPW
+          {{- end }}
+          {{- end }}
+          {{- if and .Values.dataStore.sql.readOnly.enabled (ne .Values.dataStore.sql.databaseType "gcp_mysql_sa_iam") (not $postgresRoPasswordless) }}
+          {{- if .Values.dataStore.sql.readOnly.externalSecret.enabled }}
+          - name: RODBPW
+            valueFrom:
+              secretKeyRef:
+                name: {{ .Values.dataStore.sql.readOnly.externalSecret.name }}
+                key: {{ .Values.dataStore.sql.readOnly.externalSecret.key }}
+          {{- else }}
+          - name: RODBPW
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-dbpw
+                key: RODBPW
+          {{- end }}
+          {{- end }}
+          {{- if ne .Values.keyManager.awsKMS.accessKeyID "" }}
+          - name: AWS_KMS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-cloud
+                key: AWS_KMS_ACCESS_KEY_ID
+          {{- end }}
+          {{- if ne .Values.keyManager.awsKMS.secretAccessKey "" }}
+          - name: AWS_KMS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-cloud
+                key: AWS_KMS_SECRET_ACCESS_KEY
+          {{- end }}
+          {{- with .Values.keyManager.azureKeyVault }}
+          {{- if and .enabled (or (ne .appSecret "") (ne .existingSecret "")) }}
+          - name: AZURE_KEY_VAULT_APP_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: {{ .existingSecret | default (printf "%s-cloud" $fullname) }}
+                key: AZURE_KEY_VAULT_APP_SECRET
+          {{- end }}
+          {{- end }}
+          {{- if ne .Values.secrets.aws.accessKeyID "" }}
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-cloud
+                key: AWS_ACCESS_KEY_ID
+          {{- end }}
+          {{- if ne .Values.secrets.aws.secretAccessKey "" }}
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-cloud
+                key: AWS_SECRET_ACCESS_KEY
+          {{- end }}
+          {{- if ne .Values.secrets.gcp.applicationCredentials "" }}
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            valueFrom:
+              secretKeyRef:
+                name: {{ $fullname }}-cloud
+                key: GOOGLE_APPLICATION_CREDENTIALS
+          {{- end }}
+          ports:
+            - name: grpc
+              containerPort: 8081
+              protocol: TCP
+            - containerPort: 8080
+              name: healthz
+            {{- with .Values.federation }}
+            {{- if eq (.enabled | toString) "true" }}
+            - name: federation
+              containerPort: {{ .bundleEndpoint.port }}
+              protocol: TCP
+            {{- end }}
+            {{- end }}
+            {{- if or (dig "telemetry" "prometheus" "enabled" .Values.telemetry.prometheus.enabled .Values.global) (and (dig "spire" "recommendations" "enabled" false .Values.global) (dig "spire" "recommendations" "prometheus" true .Values.global)) }}
+            - containerPort: 9988
+              name: prom
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: healthz
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: healthz
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: spire-server-socket
+              mountPath: /tmp/spire-server/private
+              readOnly: false
+            - name: spire-config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: spire-data
+              mountPath: /run/spire/data
+              readOnly: false
+            {{- with .Values.kubeConfigs }}
+            - name: kubeconfigs
+              mountPath: /kubeconfigs
+              readOnly: true
+            {{- end }}
+            {{- if $pluginLoaderNeeded }}
+            - name: plugins
+              mountPath: /plugins
+              readOnly: true
+            {{- end }}
+            {{- if .Values.nodeAttestor.tpmDirect.enabled }}
+            - name: tpm-direct
+              mountPath: /tpm
+              readOnly: true
+            {{- if ne (len .Values.nodeAttestor.tpmDirect.cas) 0 }}
+            - name: tpm-direct-cas
+              mountPath: /tpm-direct-cas
+            {{- end }}
+            {{- if ne (len .Values.nodeAttestor.tpmDirect.hashes) 0 }}
+            - name: tpm-direct-hashes
+              mountPath: /tmp-direct-hashes
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.nodeAttestor.x509POP.enabled (eq .Values.nodeAttestor.x509POP.mode "externalPKI") }}
+            {{- with .Values.nodeAttestor.x509POP }}
+            - name: x509pop-ca-bundle
+              mountPath: /run/spire/data/x509pop-ca-bundle.pem
+              subPath: ca-bundle.pem
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if or .Values.federation.tls.certManager.enabled .Values.federation.tls.externalSecret.enabled }}
+            - name: bundle-endpoint-tls
+              mountPath: /bundle-endpoint-tls
+            {{- end }}
+            {{- if eq (.Values.upstreamAuthority.disk.enabled | toString) "true" }}
+            - name: upstream-ca
+              mountPath: /run/spire/upstream_ca
+              readOnly: false
+            {{ end }}
+            {{- if eq (.Values.upstreamAuthority.ejbca.enabled | toString) "true" }}
+            - name: upstream-ejbca
+              mountPath: /run/spire/upstream_ejbca
+              readOnly: true
+            {{ end }}
+            {{- if gt (len .Values.upstreamAuthority.spire.upstreamDriver) 0 }}
+            - name: upstream-agent
+              mountPath: /run/spire/upstream_agent
+              readOnly: true
+            {{ end }}
+            {{- with .Values.keyManager.gcpKMS }}
+            {{- if and .enabled (or .keyPolicy.policy (ne .keyPolicy.existingConfigMap "")) }}
+            - name: gcp-kms-key-policy
+              mountPath: /run/spire/gcp-kms/policy
+              readOnly: true
+            {{- end }}
+            {{- if and .enabled (or .serviceAccountKey.json (ne .serviceAccountKey.existingSecret "")) }}
+            - name: gcp-kms-credentials
+              mountPath: /run/spire/gcp-kms/credentials
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- with .Values.keyManager.awsKMS }}
+            {{- if and (eq (.enabled | toString) "true") (or .keyPolicy.policy (ne .keyPolicy.existingConfigMap "")) }}
+            - name: aws-kms-key-policy
+              mountPath: /run/spire/data/aws-kms-key-policy.json
+              subPath: policy.json
+              readOnly: true
+            {{ end }}
+            {{- end }}
+            {{- with .Values.upstreamAuthority.vault }}
+            {{- if eq (.enabled | toString) "true" }}
+            {{- if eq (.k8sAuth.enabled | toString) "true" }}
+            - name: spire-psat
+              mountPath: /var/run/secrets/tokens
+            {{- end }}
+            {{- if ne (.insecureSkipVerify | toString) "true" }}
+            - name: vault-ca
+              mountPath: /run/spire/vault-upstream
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.gcpWorkloadIdentity.enabled }}
+            - name: gcp-wif-token
+              mountPath: /var/run/secrets/gcp-wif
+              readOnly: true
+            - name: gcp-wif-credconfig
+              mountPath: /etc/gcp-wif
+              readOnly: true
+            {{- end }}
+            {{- if gt (len .Values.extraVolumeMounts) 0 }}
+            {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
+            {{- end }}
+            - name: server-tmp
+              mountPath: /tmp
+              readOnly: false
+        {{- include "spire-controller-manager.containers" . | nindent 8 }}
+        {{- if eq (.Values.dynamicRegistration.enabled | toString) "true" }}
+        - name: dynamic-registration
+          securityContext:
+            {{- include "spire-lib.securitycontext-extended" (dict "root" . "securityContext" .Values.tornjak.securityContext) | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" .Values.dynamicRegistration.image.tag "image" .Values.dynamicRegistration.image "global" .Values.global "ubi" false) }}
+          imagePullPolicy: {{ .Values.dynamicRegistration.image.pullPolicy }}
+          env:
+            - name: SPIFFE_TRUST_DOMAIN
+              value: {{ include "spire-lib.trust-domain" . | quote }}
+            - name: EXPECTED_AUDIENCE
+              value: {{ .Values.dynamicRegistration.audience | quote }}
+            - name: EXPECTED_SERVICE_ACCOUNT
+              {{- if contains ":" .Values.dynamicRegistration.serviceAccount }}
+              value: {{ .Values.dynamicRegistration.serviceAccount | quote }}
+              {{- else }}
+              value: {{ printf "%s:%s" (include "spire-server.agent-namespace" .) .Values.dynamicRegistration.serviceAccount | quote }}
+              {{- end }}
+            - name: ALLOWEDID_PREFIX
+              {{- if .Values.dynamicRegistration.addClusterName.allowedIDPrefix }}
+              value: {{ printf "%s/%s" .Values.dynamicRegistration.allowedIDPrefix (include "spire-lib.cluster-name" .) | quote }}
+              {{- else }}
+              value: {{ .Values.dynamicRegistration.allowedIDPrefix | quote }}
+              {{- end }}
+            - name: ENTRY_PREFIX
+              value: {{ .Values.dynamicRegistration.entryPrefix | quote }}
+            - name: REGISTRATION_PREFIX
+              {{- if .Values.dynamicRegistration.addClusterName.registrationPrefix }}
+              value: {{ printf "%s/%s" .Values.dynamicRegistration.registrationPrefix (include "spire-lib.cluster-name" .) | quote }}
+              {{- else }}
+              value: {{ .Values.dynamicRegistration.registrationPrefix | quote }}
+              {{- end }}
+          volumeMounts:
+            - name: spire-server-socket
+              mountPath: /tmp/spire-server/private
+              readOnly: true
+          ports:
+            - name: dynamic-https
+              containerPort: 8931
+              protocol: TCP
+        {{- end }}
+        {{- if eq (.Values.tornjak.enabled | toString) "true" }}
+        - name: tornjak
+          securityContext:
+            {{- include "spire-lib.securitycontext-extended" (dict "root" . "securityContext" .Values.tornjak.securityContext) | nindent 12 }}
+          image: {{ template "spire-lib.image" (dict "appVersion" .Values.tornjak.image.defaultTag "image" .Values.tornjak.image "global" .Values.global "ubi" true) }}
+          imagePullPolicy: {{ .Values.tornjak.image.pullPolicy }}
+          {{- if eq (include "spire-tornjak.connectionType" .) "http" }}
+          startupProbe:
+            httpGet:
+              scheme: HTTP
+              path: /
+              port: 10000
+            {{- toYaml .Values.tornjak.startupProbe | nindent 12 }}
+          {{- end }}
+          args:
+            - --spire-config
+            - /run/spire/config/server.conf
+            - --tornjak-config
+            - /run/spire/tornjak-config/server.conf
+          ports:
+            - name: tornjak-http
+              containerPort: 10000
+              protocol: TCP
+            - name: tornjak-https
+              containerPort: 10443
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.tornjak.resources | nindent 12 }}
+          volumeMounts:
+            - name: {{ include "spire-tornjak.config" . }}
+              mountPath: /run/spire/tornjak-config
+            - name: spire-server-socket
+              mountPath: /tmp/spire-server/private
+              readOnly: true
+            - name: spire-config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: spire-data
+              mountPath: /run/spire/data
+              readOnly: false
+            {{- if or (eq (include "spire-tornjak.connectionType" .) "tls") (eq (include "spire-tornjak.connectionType" .) "mtls") }}
+            - name: server-cert
+              mountPath: /opt/spire/server
+            {{- end }}
+            {{- if eq (include "spire-tornjak.connectionType" .) "mtls" }}
+            - name: user-cert
+              mountPath: /opt/spire/user
+            {{- end }}
+        {{- end }}
+        {{- if eq (.Values.trustSync.enabled | toString) "true" }}
+        - name: spire-trust-sync
+          image: {{ template "spire-lib.image" (dict "appVersion" .Values.trustSync.image.defaultTag "image" .Values.trustSync.image "global" .Values.global "ubi" false) }}
+          imagePullPolicy: {{ .Values.trustSync.image.pullPolicy }}
+          args:
+          - -trust-domains={{ join "," .Values.trustSync.domains }}
+          env:
+          - name: SPIFFE_TRUST_DOMAIN
+            value: {{ include "spire-lib.trust-domain" . | quote }}
+          - name: SPIRE_SERVER_SOCKET
+            value: unix:///tmp/spire-server/private/api.sock
+          - name: SPIFFE_ENDPOINT_SOCKET
+            value: unix:///run/spire/upstream_agent/spire-agent.sock
+          volumeMounts:
+          - mountPath: /run/spire/upstream_agent
+            name: upstream-agent
+            readOnly: true
+          - mountPath: /tmp/spire-server/private
+            name: spire-server-socket
+            readOnly: true
+          securityContext:
+            {{- include "spire-lib.securitycontext" . | nindent 12 }}
+        {{- end }}
+
+        {{- if gt (len .Values.extraContainers) 0 }}
+        {{- toYaml .Values.extraContainers | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
+      volumes:
+        - name: server-tmp
+          emptyDir: {}
+        - name: spire-config
+          configMap:
+            name: {{ include "spire-server.fullname" . }}
+        - name: spire-server-socket
+          emptyDir: {}
+        - name: spire-controller-manager-tmp
+          emptyDir: {}
+        {{- if gt (len .Values.kubeConfigs) 0 }}
+        - name: kubeconfigs
+          projected:
+            sources:
+            {{- $inlineNames := list }}
+            {{- range $name, $value := .Values.kubeConfigs }}
+            {{-   if not (hasKey $value "externalSecret") }}
+            {{-     $inlineNames = append $inlineNames $name }}
+            {{-   end }}
+            {{- end }}
+            {{- if gt (len $inlineNames) 0 }}
+            - secret:
+                name: {{ include "spire-server.kubeconfigs-secret-name" . }}
+                items:
+                {{- range $name := ($inlineNames | sortAlpha) }}
+                - key: {{ $name }}
+                  path: {{ $name }}
+                {{- end }}
+            {{- end }}
+            {{- range $name, $value := .Values.kubeConfigs }}
+            {{-   if hasKey $value "externalSecret" }}
+            - secret:
+                name: {{ $value.externalSecret.name }}
+                items:
+                - key: {{ $value.externalSecret.key | default $name }}
+                  path: {{ $name }}
+            {{-   end }}
+            {{- end }}
+        {{- end }}
+        {{- if $pluginLoaderNeeded }}
+        - name: plugins
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.nodeAttestor.tpmDirect.enabled }}
+        - name: tpm-direct
+          emptyDir: {}
+        {{- if ne (len .Values.nodeAttestor.tpmDirect.cas) 0 }}
+        - name: tpm-direct-cas
+          configMap:
+            name: {{ include "spire-server.fullname" . }}-tpm-direct-ca
+        {{- end }}
+        {{- if ne (len .Values.nodeAttestor.tpmDirect.hashes) 0 }}
+        - name: tpm-direct-hashes
+          configMap:
+            name: {{ include "spire-server.fullname" . }}-tpm-direct-hash
+        {{- end }}
+        {{- end }}
+        {{- if and .Values.nodeAttestor.x509POP.enabled (eq .Values.nodeAttestor.x509POP.mode "externalPKI") }}
+        {{- with .Values.nodeAttestor.x509POP }}
+        - name: x509pop-ca-bundle
+          configMap:
+            {{- if .caBundle.bundle }}
+            name: {{ $fullname }}-x509pop-ca
+            {{- else if .caBundle.existingConfigMap }}
+            name: {{ .caBundle.existingConfigMap }}
+            {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.federation.tls.certManager.enabled }}
+        - name: bundle-endpoint-tls
+          secret:
+            secretName: {{ printf "%s-federation-cert" (include "spire-server.fullname" .) }}
+        {{- end }}
+        {{- if .Values.federation.tls.externalSecret.enabled }}
+        - name: bundle-endpoint-tls
+          secret:
+            secretName: {{ .Values.federation.tls.externalSecret.secretName }}
+        {{- end }}
+        {{- if or (eq (include "spire-tornjak.connectionType" .) "tls") (eq (include "spire-tornjak.connectionType" .) "mtls") }}
+        - name: server-cert
+          secret:
+            defaultMode: 256
+            secretName: {{ .Values.tornjak.config.tlsSecret }}
+        {{- end }}
+        {{- if eq (include "spire-tornjak.connectionType" .) "mtls" }}
+        {{- if eq .Values.tornjak.config.clientCA.type "Secret" }}
+        - name: user-cert
+          secret:
+            defaultMode: 256
+            secretName: {{ .Values.tornjak.config.clientCA.name }}
+        {{- else if eq .Values.tornjak.config.clientCA.type "ConfigMap" }}
+        - name: user-cert
+          configMap:
+            name: {{ .Values.tornjak.config.clientCA.name }}
+        {{- end }}
+        {{- end }}
+        {{- if eq (.Values.upstreamAuthority.disk.enabled | toString) "true" }}
+        - name: upstream-ca
+          secret:
+            secretName: {{ include "spire-server.upstream-ca-secret" . }}
+        {{- end }}
+        {{- if eq (.Values.upstreamAuthority.ejbca.enabled | toString) "true" }}
+        - name: upstream-ejbca
+          secret:
+            secretName: {{ include "spire-server.upstream-ejbca-secret" . }}
+        {{- end }}
+        {{- if gt (len .Values.upstreamAuthority.spire.upstreamDriver) 0 }}
+        - name: upstream-agent
+          csi:
+            driver: {{ .Values.upstreamAuthority.spire.upstreamDriver }}
+            readOnly: true
+        {{- end }}
+        {{- with .Values.keyManager.gcpKMS }}
+        {{- if and .enabled (or .keyPolicy.policy (ne .keyPolicy.existingConfigMap "")) }}
+        - name: gcp-kms-key-policy
+          configMap:
+            name: {{ .keyPolicy.existingConfigMap | default (printf "%s-gcp-kms" $fullname) }}
+            items:
+              - key: policy.json
+                path: policy.json
+        {{- end }}
+        {{- if and .enabled (or .serviceAccountKey.json (ne .serviceAccountKey.existingSecret "")) }}
+        - name: gcp-kms-credentials
+          secret:
+            secretName: {{ .serviceAccountKey.existingSecret | default (printf "%s-gcp-kms" $fullname) }}
+            items:
+              - key: service-account.json
+                path: service-account.json
+        {{- end }}
+        {{- end }}
+        {{- with .Values.keyManager.awsKMS }}
+        {{- if and (eq (.enabled | toString) "true") (or .keyPolicy.policy (ne .keyPolicy.existingConfigMap "")) }}
+        - name: aws-kms-key-policy
+          configMap:
+            {{- if .keyPolicy.policy }}
+            name: {{ $fullname }}-aws-kms
+            {{- else if ne .keyPolicy.existingConfigMap "" }}
+            name: {{ .keyPolicy.existingConfigMap }}
+            {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- if eq (.Values.controllerManager.enabled | toString) "true" }}
+        {{- if ne .Values.controllerManager.staticManifestMode "off" }}
+        - name: controller-manager-static-config
+          configMap:
+            name: {{ include "spire-controller-manager.fullname" . }}-static
+        {{- end }}
+        - name: controller-manager-config
+          configMap:
+            name: {{ include "spire-controller-manager.fullname" . }}
+        {{- end }}
+        {{- if eq (.Values.tornjak.enabled | toString) "true" }}
+        {{- if .Values.tornjak.config }}
+        - name: {{ include "spire-tornjak.config" . }}
+          configMap:
+            defaultMode: 420
+            name: {{ include "spire-tornjak.config" . }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.gcpWorkloadIdentity.enabled }}
+        - name: gcp-wif-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: https://iam.googleapis.com/{{ .Values.gcpWorkloadIdentity.providerResource }}
+                  expirationSeconds: 3600
+        - name: gcp-wif-credconfig
+          configMap:
+            name: {{ include "spire-server.fullname" . }}-gcp-wif
+        {{- end }}
+        {{- if gt (len .Values.extraVolumes) 0 }}
+        {{- toYaml .Values.extraVolumes | nindent 8 }}
+        {{- end }}
+        {{- if eq .Values.persistence.type "emptyDir" }}
+        - name: spire-data
+          emptyDir: {}
+        {{- else if eq .Values.persistence.type "hostPath" }}
+        - name: spire-data
+          hostPath:
+            path: {{ .Values.persistence.hostPath }}
+            type: Directory
+        {{- end }}
+        {{- with .Values.upstreamAuthority.vault }}
+        {{- if eq (.enabled | toString) "true" }}
+        {{- if ne (.insecureSkipVerify | toString) "true" }}
+        {{- if eq (.caCert.type | lower) "configmap" }}
+        - name: vault-ca
+          configMap:
+            name: {{ .caCert.name }}
+        {{- else if eq (.caCert.type | lower) "secret" }}
+        - name: vault-ca
+          secret:
+            secretName: {{ .caCert.name }}
+            optional: false
+        {{- end }}
+        {{- end -}}
+        {{- if eq (.k8sAuth.enabled | toString) "true" }}
+        - name: spire-psat
+          projected:
+            sources:
+            - serviceAccountToken:
+                path: spire-server
+                expirationSeconds: {{ .k8sAuth.token.expiry }}
+                {{- if ne .k8sAuth.token.audience "" }}
+                audience: {{ .k8sAuth.token.audience }}
+                {{- end }}
+        {{- end }}
+        {{- end -}}
+        {{- end -}}
+  {{- if eq .Values.persistence.type "pvc" }}
+  volumeClaimTemplates:
+    - metadata:
+        name: spire-data
+      spec:
+        accessModes:
+          - {{ .Values.persistence.accessMode | default "ReadWriteOnce" }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- $storageClass := (dig "spire" "persistence" "storageClass" nil .Values.global) | default .Values.persistence.storageClass }}
+        {{- if $storageClass }}
+        storageClassName: {{ $storageClass }}
+        {{- end }}
+  {{- end }}
+{{- end }}

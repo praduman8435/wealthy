@@ -1,0 +1,39 @@
+dependencies:
+- name: spire-lib
+  repository: file://../spire-lib
+  version: 0.3.3
+- name: spire-server
+  repository: file://./charts/spire-server
+  version: 0.1.0
+- name: spire-agent
+  repository: file://./charts/spire-agent
+  version: 0.1.0
+- name: spire-agent
+  repository: file://./charts/spire-agent
+  version: 0.1.0
+- name: spiffe-csi-driver
+  repository: file://./charts/spiffe-csi-driver
+  version: 0.1.0
+- name: spiffe-csi-driver
+  repository: file://./charts/spiffe-csi-driver
+  version: 0.1.0
+- name: spiffe-oidc-discovery-provider
+  repository: file://./charts/spiffe-oidc-discovery-provider
+  version: 0.1.0
+- name: tornjak-frontend
+  repository: file://./charts/tornjak-frontend
+  version: 0.1.0
+- name: spike-keeper
+  repository: file://./charts/spike-keeper
+  version: 0.1.0
+- name: spike-nexus
+  repository: file://./charts/spike-nexus
+  version: 0.1.0
+- name: spike-pilot
+  repository: file://./charts/spike-pilot
+  version: 0.1.0
+- name: spire-identity-exchange
+  repository: file://../spire-identity-exchange
+  version: 0.2.4
+digest: sha256:3edf71a4ae8882f6faaf06ab7c1b180c9355c8f3832e003cf384d61cef941421
+generated: "2026-10-23T09:16:36.783281-07:00"

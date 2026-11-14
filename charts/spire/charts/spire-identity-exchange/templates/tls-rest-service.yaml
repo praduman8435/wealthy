@@ -1,0 +1,23 @@
+{{- if .Values.tls.rest.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spire-identity-exchange.fullname" . }}-rest
+  namespace: {{ include "spire-identity-exchange.namespace" . }}
+  {{- with .Values.tls.rest.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.tls.rest.service.type }}
+  {{- if and (eq .Values.tls.rest.service.type "LoadBalancer") .Values.tls.rest.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.tls.rest.service.loadBalancerIP }}
+  {{- end }}
+  ports:
+    - name: https
+      port: {{ .Values.tls.rest.service.port }}
+      targetPort: rest
+      protocol: TCP
+  selector:
+    {{- include "spire-identity-exchange.selectorLabels" . | nindent 4 }}
+{{- end }}
